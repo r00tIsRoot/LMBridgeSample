@@ -1,0 +1,4 @@
+<resources>
+    <!-- Compose 앱: 실제 색상은 Compose 테마가 담당하고, XML 테마는 창 껍데기만 제공 -->
+    <style name="Theme.LMBridgeSample" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>

@@ -1,0 +1,457 @@
+package com.isroot.lmbridgesample
+
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.DrawerValue
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalDrawerSheet
+import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.rememberDrawerState
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.isroot.lmbridgesample.ui.theme.LMBridgeSampleTheme
+import kotlinx.coroutines.launch
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
+        setContent {
+            LMBridgeSampleTheme {
+                val vm: ChatViewModel = viewModel()
+                val state by vm.uiState.collectAsStateWithLifecycle()
+                when (state.screen) {
+                    Screen.ModelSelect -> ModelSelectScreen(state, onSelect = vm::selectModel)
+                    Screen.Downloading -> DownloadScreen(state, onDownload = vm::downloadModel)
+                    Screen.Chat -> ChatScreen(
+                        state = state,
+                        onSend = vm::send,
+                        onStop = vm::stop,
+                        onNewRoom = vm::createRoom,
+                        onSelectRoom = vm::selectRoom,
+                        onDeleteRoom = vm::deleteRoom,
+                        onChangeModel = vm::changeModel,
+                    )
+                }
+            }
+        }
+    }
+}
+
+// ── 모델 선택 ────────────────────────────────────────────────────────────────
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ModelSelectScreen(state: UiState, onSelect: (String) -> Unit) {
+    Scaffold(
+        topBar = { TopAppBar(title = { Text("모델 선택") }) },
+    ) { padding ->
+        Column(
+            Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .padding(16.dp),
+        ) {
+            Text(
+                "사용할 온디바이스 모델을 고르세요.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.secondary,
+            )
+            if (state.loadError != null) {
+                Spacer(Modifier.height(12.dp))
+                Surface(
+                    color = MaterialTheme.colorScheme.errorContainer,
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(
+                        state.loadError,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onErrorContainer,
+                        modifier = Modifier.padding(12.dp),
+                    )
+                }
+            }
+            Spacer(Modifier.height(16.dp))
+            LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                items(state.models) { m -> ModelCard(m, onSelect) }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ModelCard(m: ModelUi, onSelect: (String) -> Unit) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onSelect(m.key) },
+    ) {
+        Column(Modifier.padding(16.dp)) {
+            Text(m.label, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            Spacer(Modifier.height(4.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(m.sizeLabel, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.secondary)
+                Spacer(Modifier.weight(1f))
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    if (m.downloaded) Badge("다운로드됨", MaterialTheme.colorScheme.primary)
+                    if (m.gated) Badge("게이트", MaterialTheme.colorScheme.tertiary)
+                }
+            }
+            Spacer(Modifier.height(12.dp))
+            Button(onClick = { onSelect(m.key) }, modifier = Modifier.fillMaxWidth()) {
+                Text(if (m.downloaded) "선택" else "다운로드 후 선택")
+            }
+        }
+    }
+}
+
+@Composable
+private fun Badge(text: String, color: androidx.compose.ui.graphics.Color) {
+    Surface(color = color.copy(alpha = 0.15f), shape = RoundedCornerShape(6.dp)) {
+        Text(
+            text,
+            style = MaterialTheme.typography.labelSmall,
+            color = color,
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+        )
+    }
+}
+
+// ── 다운로드 ─────────────────────────────────────────────────────────────────
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun DownloadScreen(state: UiState, onDownload: (String?) -> Unit) {
+    var token by remember { mutableStateOf("") }
+    Scaffold(
+        topBar = { TopAppBar(title = { Text("모델 다운로드") }) },
+    ) { padding ->
+        Column(
+            Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+        ) {
+            Text(state.downloadModelLabel, style = MaterialTheme.typography.titleMedium)
+            Spacer(Modifier.height(8.dp))
+            Text(
+                state.downloadError ?: state.downloadStatus,
+                style = MaterialTheme.typography.bodyMedium,
+                textAlign = TextAlign.Center,
+                color = if (state.downloadError != null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface,
+            )
+            Spacer(Modifier.height(24.dp))
+
+            if (state.isDownloading) {
+                if (state.downloadPercent > 0) {
+                    LinearProgressIndicator(progress = { state.downloadPercent / 100f }, modifier = Modifier.fillMaxWidth())
+                } else {
+                    LinearProgressIndicator(Modifier.fillMaxWidth())
+                }
+            } else {
+                if (state.requiresToken) {
+                    Text(
+                        "게이트(제한) 모델입니다. 다운로드하려면:\n" +
+                            "① ${state.modelPageUrl} 에서 로그인 후 라이선스 동의\n" +
+                            "② huggingface.co/settings/tokens 에서 읽기 권한 토큰(hf_…) 발급\n" +
+                            "③ 아래에 붙여넣기",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.secondary,
+                    )
+                    Spacer(Modifier.height(12.dp))
+                }
+                OutlinedTextField(
+                    value = token,
+                    onValueChange = { token = it },
+                    label = { Text(if (state.requiresToken) "HF Access Token (필수)" else "HF Access Token (선택)") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(12.dp))
+                Button(
+                    onClick = { onDownload(token) },
+                    enabled = !(state.requiresToken && token.isBlank()),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(if (state.downloadError != null) "다시 시도" else "다운로드")
+                }
+            }
+        }
+    }
+}
+
+// ── 채팅(드로어 + 대화) ──────────────────────────────────────────────────────
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ChatScreen(
+    state: UiState,
+    onSend: (String) -> Unit,
+    onStop: () -> Unit,
+    onNewRoom: () -> Unit,
+    onSelectRoom: (String) -> Unit,
+    onDeleteRoom: (String) -> Unit,
+    onChangeModel: () -> Unit,
+) {
+    val drawerState = rememberDrawerState(DrawerValue.Closed)
+    val scope = rememberCoroutineScope()
+
+    ModalNavigationDrawer(
+        drawerState = drawerState,
+        drawerContent = {
+            ModalDrawerSheet {
+                DrawerContent(
+                    state = state,
+                    onNewRoom = { onNewRoom(); scope.launch { drawerState.close() } },
+                    onSelectRoom = { onSelectRoom(it); scope.launch { drawerState.close() } },
+                    onDeleteRoom = onDeleteRoom,
+                    onChangeModel = { onChangeModel(); scope.launch { drawerState.close() } },
+                )
+            }
+        },
+    ) {
+        Scaffold(
+            topBar = {
+                TopAppBar(
+                    title = { Text(state.activeModelLabel.ifEmpty { "채팅" }) },
+                    navigationIcon = {
+                        TextButton(onClick = { scope.launch { drawerState.open() } }) { Text("☰") }
+                    },
+                )
+            },
+        ) { padding ->
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .padding(padding)
+                    .padding(16.dp),
+            ) {
+                if (state.preparing) {
+                    Column(
+                        Modifier.fillMaxSize(),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center,
+                    ) {
+                        CircularProgressIndicator()
+                        Spacer(Modifier.height(12.dp))
+                        Text("준비 중…", style = MaterialTheme.typography.bodyMedium)
+                    }
+                } else {
+                    ChatArea(state = state, onSend = onSend, onStop = onStop)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DrawerContent(
+    state: UiState,
+    onNewRoom: () -> Unit,
+    onSelectRoom: (String) -> Unit,
+    onDeleteRoom: (String) -> Unit,
+    onChangeModel: () -> Unit,
+) {
+    val busy = state.isGenerating || state.preparing
+    Column(Modifier.fillMaxSize().padding(16.dp)) {
+        Text("모델", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.secondary)
+        Spacer(Modifier.height(4.dp))
+        Text(state.activeModelLabel, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(8.dp))
+        OutlinedButton(
+            onClick = onChangeModel,
+            enabled = !busy,
+            modifier = Modifier.fillMaxWidth(),
+        ) { Text("모델 변경") }
+
+        Spacer(Modifier.height(16.dp))
+        HorizontalDivider()
+        Spacer(Modifier.height(16.dp))
+
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                "채팅방",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.secondary,
+            )
+            Spacer(Modifier.weight(1f))
+            TextButton(onClick = onNewRoom, enabled = !busy) { Text("＋ 새 채팅방") }
+        }
+        Spacer(Modifier.height(8.dp))
+
+        LazyColumn(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            items(state.rooms) { room ->
+                RoomRow(
+                    room = room,
+                    selected = room.id == state.activeRoomId,
+                    enabled = !busy,
+                    onSelect = { onSelectRoom(room.id) },
+                    onDelete = { onDeleteRoom(room.id) },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun RoomRow(
+    room: RoomUi,
+    selected: Boolean,
+    enabled: Boolean,
+    onSelect: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    Surface(
+        color = if (selected) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.surface,
+        shape = RoundedCornerShape(8.dp),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .clickable(enabled = enabled) { onSelect() }
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                room.title,
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.weight(1f),
+                maxLines = 1,
+            )
+            TextButton(onClick = onDelete, enabled = enabled) { Text("🗑") }
+        }
+    }
+}
+
+@Composable
+private fun ChatArea(
+    state: UiState,
+    onSend: (String) -> Unit,
+    onStop: () -> Unit,
+) {
+    var input by remember { mutableStateOf("") }
+    val listState = rememberLazyListState()
+
+    // 새 토큰이 붙을 때마다 맨 아래로 스크롤
+    LaunchedEffect(state.messages.size, state.messages.lastOrNull()?.text) {
+        if (state.messages.isNotEmpty()) listState.animateScrollToItem(state.messages.size - 1)
+    }
+
+    Column(Modifier.fillMaxSize()) {
+        if (state.messages.isEmpty()) {
+            Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                Text(
+                    "메시지를 입력해 대화를 시작하세요.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.secondary,
+                )
+            }
+        } else {
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.weight(1f).fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                items(state.messages) { msg -> MessageBubble(msg) }
+            }
+        }
+
+        Spacer(Modifier.height(8.dp))
+
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(
+                value = input,
+                onValueChange = { input = it },
+                modifier = Modifier.weight(1f),
+                placeholder = { Text("메시지를 입력…") },
+                enabled = !state.isGenerating,
+            )
+            if (state.isGenerating) {
+                OutlinedButton(onClick = onStop, modifier = Modifier.padding(start = 8.dp)) { Text("중지") }
+            } else {
+                Button(
+                    onClick = {
+                        onSend(input)
+                        input = ""
+                    },
+                    enabled = input.isNotBlank(),
+                    modifier = Modifier.padding(start = 8.dp),
+                ) { Text("전송") }
+            }
+        }
+    }
+}
+
+@Composable
+private fun MessageBubble(msg: ChatMessage) {
+    val isUser = msg.role == Role.USER
+    Row(
+        Modifier.fillMaxWidth(),
+        horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start,
+    ) {
+        Card(
+            shape = RoundedCornerShape(12.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = if (isUser) {
+                    MaterialTheme.colorScheme.primaryContainer
+                } else {
+                    MaterialTheme.colorScheme.surfaceVariant
+                },
+            ),
+            modifier = Modifier.widthIn(max = 300.dp),
+        ) {
+            Text(
+                text = msg.text.ifEmpty { "…" },
+                modifier = Modifier.padding(12.dp),
+                style = MaterialTheme.typography.bodyMedium,
+            )
+        }
+    }
+}

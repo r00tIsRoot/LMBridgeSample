@@ -14,6 +14,8 @@ android {
         targetSdk = 36
         versionCode = 1
         versionName = "1.0"
+
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {
@@ -41,7 +43,7 @@ dependencies {
     // ── LMBridge (GitHub Pages Maven 저장소에서 해석) ──
     // litertlm·coroutines 등 라이브러리의 런타임 의존성은 AAR + Gradle Module
     // Metadata를 통해 자동으로 따라오므로 여기서 따로 선언할 필요가 없다.
-    implementation("com.isroot:lmbridge:0.2.2")
+    implementation("com.isroot:lmbridge:0.2.4")
 
     // 앱이 직접 Flow/코루틴을 사용하므로 컴파일 클래스패스에 필요.
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
@@ -57,4 +59,11 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
     debugImplementation("androidx.compose.ui:ui-tooling")
+
+    // ── 계측 테스트(멀티모달 E2E) ──
+    androidTestImplementation("junit:junit:4.13.2")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test:core-ktx:1.6.1")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
 }

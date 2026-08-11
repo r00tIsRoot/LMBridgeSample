@@ -16,12 +16,44 @@ data class SampleModel(
     val label: String,
     val info: ModelDownloadManager.ModelInfo,
     val gated: Boolean,
+    /** 이미지(비전) 입력 지원 여부. */
+    val vision: Boolean,
+    /** 오디오 입력 지원 여부. */
+    val audio: Boolean,
 ) {
     val sizeLabel: String get() = "약 ${info.sizeInBytes / 1_000_000}MB"
     val pageUrl: String get() = "https://huggingface.co/${info.modelId}"
+
+    /** 이미지 또는 오디오 중 하나라도 지원하면 멀티모달. */
+    val multimodal: Boolean get() = vision || audio
 }
 
 object SampleModels {
+
+    /**
+     * 이미지(비전) 인코더를 가진 모델 id. 이 목록에 있는 모델만 이미지 입력을 활성화한다
+     * (`setMaxNumImages`). 텍스트 전용 모델에 비전을 켜면 초기화가 실패한다.
+     */
+    private val VISION_MODEL_IDS = setOf(
+        "litert-community/gemma-4-E2B-it-litert-lm",
+        "litert-community/gemma-4-E4B-it-litert-lm",
+        "google/gemma-3n-E2B-it-litert-lm",
+        "google/gemma-3n-E4B-it-litert-lm",
+        "litert-community/FastVLM-0.5B",
+        "litert-community/MedGemma-1.5-4B-IT",
+    )
+
+    /**
+     * 오디오 인코더를 가진 모델 id(Gemma 3n 계열). 이 목록에 있는 모델만 오디오 입력을
+     * 활성화한다(`setAudioBackend`).
+     */
+    private val AUDIO_MODEL_IDS = setOf(
+        "litert-community/gemma-4-E2B-it-litert-lm",
+        "litert-community/gemma-4-E4B-it-litert-lm",
+        "google/gemma-3n-E2B-it-litert-lm",
+        "google/gemma-3n-E4B-it-litert-lm",
+    )
+
     /** 라이브러리 카탈로그를 그대로 반영한 선택 목록. key는 modelId다. */
     val ALL: List<SampleModel> = ModelCatalog.ALL.map { info ->
         SampleModel(
@@ -29,6 +61,8 @@ object SampleModels {
             label = info.displayName,
             info = info,
             gated = info.gated,
+            vision = info.modelId in VISION_MODEL_IDS,
+            audio = info.modelId in AUDIO_MODEL_IDS,
         )
     }
 

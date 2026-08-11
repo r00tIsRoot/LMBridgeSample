@@ -1,6 +1,10 @@
 package com.isroot.lmbridgesample
 
 import android.app.Application
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.net.Uri
+import android.provider.OpenableColumns
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -11,6 +15,7 @@ import com.isroot.lmbridge.download.ModelDownloadManager.DownloadStatus
 import com.isroot.lmbridge.models.Chat
 import com.isroot.lmbridge.models.ChatConfig
 import com.isroot.lmbridge.models.GenerationChunk
+import com.isroot.lmbridge.models.MultimodalInput
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.withContext
@@ -19,6 +24,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import java.io.File
 
 /** 앱이 그리는 최상위 화면. */
 enum class Screen { ModelSelect, Downloading, Chat }
@@ -26,6 +32,21 @@ enum class Screen { ModelSelect, Downloading, Chat }
 enum class Role { USER, ASSISTANT }
 
 data class ChatMessage(val role: Role, val text: String)
+
+/** 첨부 종류. */
+enum class AttachmentKind { IMAGE, AUDIO, DOCUMENT }
+
+/**
+ * 전송 대기 중인 첨부의 UI 표현(칩 렌더링용). 실제 바이트/경로는 ViewModel 내부에만 둔다.
+ *
+ * @property preview 이미지 첨부의 축소 미리보기(다른 종류는 null).
+ */
+data class AttachmentUi(
+    val id: String,
+    val kind: AttachmentKind,
+    val label: String,
+    val preview: Bitmap? = null,
+)
 
 /** 모델 선택 화면 카드 1개. */
 data class ModelUi(
@@ -60,7 +81,14 @@ data class UiState(
     val activeRoomId: String? = null,
     val messages: List<ChatMessage> = emptyList(),
     val isGenerating: Boolean = false,
-)
+    // 멀티모달
+    val visionActive: Boolean = false,
+    val audioActive: Boolean = false,
+    val attachments: List<AttachmentUi> = emptyList(),
+    val attachError: String? = null,
+) {
+    val multimodalActive: Boolean get() = visionActive || audioActive
+}
 
 /**
  * 다중 모델 · 다중 채팅방을 관리하는 ViewModel.
@@ -107,6 +135,36 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     // 네이티브 세션 생성/해제(newChat·close·release)는 블로킹이다. 메인 스레드에서 호출하면
     // ANR로 이어지므로 항상 백그라운드 디스패처로 넘기고, 이 플래그로 중복 실행을 막는다.
     private var roomBusy = false
+
+    /**
+     * 전송 대기 중인 첨부. 실제 미디어 바이트/경로는 여기(내부)에만 두고, UI에는 [AttachmentUi]로
+     * 요약해 노출한다(큰 바이트 배열을 StateFlow로 흘리지 않기 위함).
+     */
+    private sealed class PendingAttachment(
+        val id: String,
+        val kind: AttachmentKind,
+        val label: String,
+    ) {
+        abstract fun toUi(): AttachmentUi
+
+        class Image(id: String, label: String, val bytes: ByteArray, val preview: Bitmap?) :
+            PendingAttachment(id, AttachmentKind.IMAGE, label) {
+            override fun toUi() = AttachmentUi(id, kind, label, preview)
+        }
+
+        class Audio(id: String, label: String, val bytes: ByteArray) :
+            PendingAttachment(id, AttachmentKind.AUDIO, label) {
+            override fun toUi() = AttachmentUi(id, kind, label)
+        }
+
+        class Document(id: String, label: String, val path: String) :
+            PendingAttachment(id, AttachmentKind.DOCUMENT, label) {
+            override fun toUi() = AttachmentUi(id, kind, label)
+        }
+    }
+
+    private val pendingAttachments = mutableListOf<PendingAttachment>()
+    private var attachmentCounter = 0
 
     private val _uiState = MutableStateFlow(UiState())
     val uiState: StateFlow<UiState> = _uiState.asStateFlow()
@@ -214,6 +272,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private fun loadModel(key: String) {
         val sm = SampleModels.byKey(key) ?: return
 
+        clearAttachmentsInternal()
         _uiState.update {
             it.copy(
                 screen = Screen.Chat,
@@ -221,16 +280,34 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 activeModelLabel = sm.label,
                 isGenerating = false,
                 loadError = null,
+                // 멀티모달 능력은 로드 시작 시점에 확정(첨부 버튼 노출 판단에 사용).
+                visionActive = sm.vision,
+                audioActive = sm.audio,
+                attachments = emptyList(),
+                attachError = null,
             )
         }
 
         viewModelScope.launch {
             releaseActiveClient() // 이전 모델 자원 해제(방 기록은 유지) — 네이티브 close/release는 off-main
 
+            // 멀티모달 모델은 메인 백엔드를 GPU로 둔다(대형 비전 모델의 CPU 텍스트 초기화가
+            // 메모리 한계로 실패하는 기기가 있음). 비전/오디오 인코더는 CPU로 분리한다 — 일부
+            // GPU는 이미지 샘플러(OpenCL)를 지원하지 않아 GPU 비전이 실패할 수 있기 때문.
+            // setMaxNumTokens는 호출하지 않는다 → 각 모델 번들에 내장된 최대 컨텍스트
+            // (파일명 ekvNNNN, 예: ekv4096)를 그대로 사용한다. 과거 1024 고정은 큰 문서/
+            // 오디오 입력을 총 컨텍스트(입력+출력) 1024 토큰으로 묶어버렸다.
             val client = LMBridgeClient.Builder(appContext)
                 .setModel(sm.info)
-                .setBackend(LMBridge.Backend.CPU)
-                .setMaxNumTokens(1024)
+                .setBackend(if (sm.multimodal) LMBridge.Backend.GPU else LMBridge.Backend.CPU)
+                .apply {
+                    if (sm.vision) {
+                        setMaxNumImages(1)
+                        setVisionBackend(LMBridge.Backend.CPU)
+                    }
+                    if (sm.audio) setAudioBackend(LMBridge.Backend.CPU)
+                }
+                .setMaxNumTokens(8500)
                 .build()
             activeClient = client
             activeModelKey = key
@@ -263,6 +340,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     /** 채팅 화면 → 모델 선택 화면으로. 활성 클라이언트를 해제한다(방 기록은 메모리에 유지). */
     fun changeModel() {
+        clearAttachmentsInternal()
         // UI는 즉시 전환하고(스냅), 블로킹 네이티브 해제는 백그라운드에서 진행한다.
         _uiState.update {
             it.copy(
@@ -274,6 +352,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 messages = emptyList(),
                 isGenerating = false,
                 loadError = null,
+                visionActive = false,
+                audioActive = false,
+                attachments = emptyList(),
+                attachError = null,
             )
         }
         viewModelScope.launch { releaseActiveClient() }
@@ -335,6 +417,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val client = activeClient ?: return
         val key = activeModelKey ?: return
         if (roomBusy || _uiState.value.isGenerating || _uiState.value.preparing) return
+        clearAttachmentsInternal()
         roomBusy = true
         _uiState.update { it.copy(preparing = true) }
         viewModelScope.launch {
@@ -357,6 +440,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         if (id == activeRoomId) return
         if (roomBusy || _uiState.value.isGenerating || _uiState.value.preparing) return
         val target = activeRooms()?.firstOrNull { it.id == id } ?: return
+        clearAttachmentsInternal()
         roomBusy = true
         _uiState.update { it.copy(preparing = true) }
         viewModelScope.launch {
@@ -377,6 +461,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         if (roomBusy || _uiState.value.isGenerating || _uiState.value.preparing) return
         val list = activeRooms() ?: return
         val room = list.firstOrNull { it.id == id } ?: return
+        clearAttachmentsInternal()
         roomBusy = true
         _uiState.update { it.copy(preparing = true) }
         viewModelScope.launch {
@@ -401,23 +486,190 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    // ── 첨부(멀티모달) ─────────────────────────────────────────────────────────
+
+    /**
+     * 이미지 첨부. content:// URI를 이미 인코딩된 바이트로 읽어 그대로 모델에 전달한다
+     * (재인코딩 없음). 미리보기용 축소 비트맵만 별도로 디코드한다.
+     */
+    fun attachImage(uri: Uri) {
+        if (!_uiState.value.visionActive) {
+            setAttachError("이 모델은 이미지 입력을 지원하지 않습니다.")
+            return
+        }
+        resolveAttachment(uri, "이미지") { bytes, name ->
+            PendingAttachment.Image(nextAttachmentId(), name, bytes, decodePreview(bytes))
+        }
+    }
+
+    /** 오디오 첨부. URI 바이트를 그대로 전달한다. */
+    fun attachAudio(uri: Uri) {
+        if (!_uiState.value.audioActive) {
+            setAttachError("이 모델은 오디오 입력을 지원하지 않습니다.")
+            return
+        }
+        resolveAttachment(uri, "오디오") { bytes, name ->
+            PendingAttachment.Audio(nextAttachmentId(), name, bytes)
+        }
+    }
+
+    /**
+     * 텍스트 문서 첨부. URI 내용을 앱 캐시의 임시 파일로 복사해 그 경로를 전달한다
+     * (라이브러리 [MultimodalInput.Builder.document]가 경로에서 텍스트를 읽어 컨텍스트로 주입).
+     * 문서는 모든 모델에서 동작한다(텍스트 주입).
+     */
+    fun attachDocument(uri: Uri) {
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    val name = displayName(uri, "document.txt")
+                    val file = copyToCache(uri, name)
+                    PendingAttachment.Document(nextAttachmentId(), name, file.absolutePath)
+                }
+            }
+            result
+                .onSuccess { addAttachment(it) }
+                .onFailure { setAttachError("문서 첨부 실패: ${it.message}") }
+        }
+    }
+
+    /** 대기 중 첨부 1개 제거. */
+    fun removeAttachment(id: String) {
+        pendingAttachments.removeAll { it.id == id }
+        renderAttachments()
+    }
+
+    /** 대기 중 첨부 전체 제거. */
+    fun clearAttachments() {
+        clearAttachmentsInternal()
+        renderAttachments()
+    }
+
+    /** 첨부 오류 배너 소거. */
+    fun dismissAttachError() = _uiState.update { it.copy(attachError = null) }
+
+    private fun resolveAttachment(
+        uri: Uri,
+        label: String,
+        build: (bytes: ByteArray, name: String) -> PendingAttachment,
+    ) {
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    val bytes = readBytes(uri) ?: error("내용을 읽을 수 없습니다.")
+                    build(bytes, displayName(uri, label))
+                }
+            }
+            result
+                .onSuccess { addAttachment(it) }
+                .onFailure { setAttachError("$label 첨부 실패: ${it.message}") }
+        }
+    }
+
+    private fun addAttachment(a: PendingAttachment) {
+        pendingAttachments.add(a)
+        _uiState.update { it.copy(attachError = null) }
+        renderAttachments()
+    }
+
+    private fun clearAttachmentsInternal() {
+        pendingAttachments.clear()
+    }
+
+    private fun setAttachError(message: String) =
+        _uiState.update { it.copy(attachError = message) }
+
+    private fun nextAttachmentId(): String {
+        attachmentCounter += 1
+        return "att-$attachmentCounter"
+    }
+
+    private fun renderAttachments() {
+        _uiState.update { s -> s.copy(attachments = pendingAttachments.map { it.toUi() }) }
+    }
+
+    private fun readBytes(uri: Uri): ByteArray? =
+        appContext.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+
+    private fun displayName(uri: Uri, fallback: String): String = runCatching {
+        appContext.contentResolver
+            .query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+            ?.use { c -> if (c.moveToFirst() && !c.isNull(0)) c.getString(0) else null }
+    }.getOrNull() ?: fallback
+
+    private fun copyToCache(uri: Uri, name: String): File {
+        val safe = name.replace(Regex("[^A-Za-z0-9._-]"), "_").ifBlank { "attachment" }
+        val out = File(appContext.cacheDir, "attach_${nextAttachmentId()}_$safe")
+        appContext.contentResolver.openInputStream(uri)?.use { input ->
+            out.outputStream().use { input.copyTo(it) }
+        } ?: error("내용을 읽을 수 없습니다.")
+        return out
+    }
+
+    /** 첨부 미리보기용 축소 비트맵. 실패해도(디코드 불가) null 로 무시한다. */
+    private fun decodePreview(bytes: ByteArray, target: Int = 256): Bitmap? = runCatching {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+        var sample = 1
+        val longEdge = maxOf(bounds.outWidth, bounds.outHeight)
+        while (longEdge > 0 && longEdge / sample > target) sample *= 2
+        val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
+    }.getOrNull()
+
+    private fun AttachmentKind.icon(): String = when (this) {
+        AttachmentKind.IMAGE -> "🖼️"
+        AttachmentKind.AUDIO -> "🎵"
+        AttachmentKind.DOCUMENT -> "📄"
+    }
+
     // ── 생성 ─────────────────────────────────────────────────────────────────
 
-    /** 프롬프트를 전송하고 토큰을 스트리밍으로 받아 마지막 말풍선에 채운다. */
+    /**
+     * 프롬프트(+첨부)를 전송하고 토큰을 스트리밍으로 받아 마지막 말풍선에 채운다.
+     *
+     * 대기 중 첨부가 있으면 [MultimodalInput]으로 묶어 보낸다(첨부 → 텍스트 순서). 첨부는
+     * 전송 직후 비워진다.
+     */
     fun send(prompt: String) {
         val room = currentRoom() ?: return
         val chat = room.chat ?: return
-        if (prompt.isBlank() || _uiState.value.isGenerating) return
+        val attachments = pendingAttachments.toList()
+        val hasAttachments = attachments.isNotEmpty()
+        if ((prompt.isBlank() && !hasAttachments) || _uiState.value.isGenerating) return
 
-        room.messages.add(ChatMessage(Role.USER, prompt))
-        if (room.title.startsWith("새 채팅")) room.title = prompt.take(18)
+        // 사용자 말풍선에는 첨부 요약 줄 + 프롬프트를 함께 보여준다.
+        val summary = attachments.joinToString("") { "${it.kind.icon()} ${it.label}\n" }
+        val userText = (summary + prompt).trimEnd().ifBlank { summary.trim() }
+        room.messages.add(ChatMessage(Role.USER, userText))
+        if (room.title.startsWith("새 채팅")) {
+            room.title = prompt.ifBlank { attachments.firstOrNull()?.label ?: "첨부" }.take(18)
+        }
         room.messages.add(ChatMessage(Role.ASSISTANT, ""))
-        _uiState.update { it.copy(isGenerating = true) }
+
+        // 첨부는 소비했으므로 비운다.
+        clearAttachmentsInternal()
+        _uiState.update { it.copy(isGenerating = true, attachments = emptyList()) }
         renderChat() // 방 제목이 바뀔 수 있으므로 목록까지 갱신
+
+        val stream = if (hasAttachments) {
+            val builder = MultimodalInput.Builder()
+            attachments.forEach { a ->
+                when (a) {
+                    is PendingAttachment.Image -> builder.imageBytes(a.bytes)
+                    is PendingAttachment.Audio -> builder.audioBytes(a.bytes)
+                    is PendingAttachment.Document -> builder.document(a.path)
+                }
+            }
+            if (prompt.isNotBlank()) builder.text(prompt)
+            chat.send(builder.build())
+        } else {
+            chat.send(prompt)
+        }
 
         val builder = StringBuilder()
         generateJob = viewModelScope.launch {
-            chat.send(prompt).collect { chunk ->
+            stream.collect { chunk ->
                 when (chunk) {
                     is GenerationChunk.Token -> {
                         builder.append(chunk.text)

@@ -1,9 +1,14 @@
 package com.isroot.lmbridgesample
 
+import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -14,8 +19,10 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -47,6 +54,9 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -74,6 +84,11 @@ class MainActivity : ComponentActivity() {
                         onSelectRoom = vm::selectRoom,
                         onDeleteRoom = vm::deleteRoom,
                         onChangeModel = vm::changeModel,
+                        onAttachImage = vm::attachImage,
+                        onAttachAudio = vm::attachAudio,
+                        onAttachDocument = vm::attachDocument,
+                        onRemoveAttachment = vm::removeAttachment,
+                        onDismissAttachError = vm::dismissAttachError,
                     )
                 }
             }
@@ -238,6 +253,11 @@ private fun ChatScreen(
     onSelectRoom: (String) -> Unit,
     onDeleteRoom: (String) -> Unit,
     onChangeModel: () -> Unit,
+    onAttachImage: (Uri) -> Unit,
+    onAttachAudio: (Uri) -> Unit,
+    onAttachDocument: (Uri) -> Unit,
+    onRemoveAttachment: (String) -> Unit,
+    onDismissAttachError: () -> Unit,
 ) {
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
@@ -283,7 +303,16 @@ private fun ChatScreen(
                         Text("준비 중…", style = MaterialTheme.typography.bodyMedium)
                     }
                 } else {
-                    ChatArea(state = state, onSend = onSend, onStop = onStop)
+                    ChatArea(
+                        state = state,
+                        onSend = onSend,
+                        onStop = onStop,
+                        onAttachImage = onAttachImage,
+                        onAttachAudio = onAttachAudio,
+                        onAttachDocument = onAttachDocument,
+                        onRemoveAttachment = onRemoveAttachment,
+                        onDismissAttachError = onDismissAttachError,
+                    )
                 }
             }
         }
@@ -375,9 +404,25 @@ private fun ChatArea(
     state: UiState,
     onSend: (String) -> Unit,
     onStop: () -> Unit,
+    onAttachImage: (Uri) -> Unit,
+    onAttachAudio: (Uri) -> Unit,
+    onAttachDocument: (Uri) -> Unit,
+    onRemoveAttachment: (String) -> Unit,
+    onDismissAttachError: () -> Unit,
 ) {
     var input by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
+
+    // 파일 선택기: 이미지는 사진 선택기(PickVisualMedia), 오디오/문서는 GetContent(MIME 지정).
+    val pickImage = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickVisualMedia(),
+    ) { uri -> uri?.let(onAttachImage) }
+    val pickAudio = rememberLauncherForActivityResult(
+        ActivityResultContracts.GetContent(),
+    ) { uri -> uri?.let(onAttachAudio) }
+    val pickDocument = rememberLauncherForActivityResult(
+        ActivityResultContracts.GetContent(),
+    ) { uri -> uri?.let(onAttachDocument) }
 
     // 새 토큰이 붙을 때마다 맨 아래로 스크롤
     LaunchedEffect(state.messages.size, state.messages.lastOrNull()?.text) {
@@ -405,6 +450,72 @@ private fun ChatArea(
 
         Spacer(Modifier.height(8.dp))
 
+        // 첨부 오류 배너
+        state.attachError?.let { err ->
+            Surface(
+                color = MaterialTheme.colorScheme.errorContainer,
+                shape = RoundedCornerShape(8.dp),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Row(
+                    Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        err,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onErrorContainer,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(onClick = onDismissAttachError) { Text("닫기") }
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+        }
+
+        // 첨부 칩 목록
+        if (state.attachments.isNotEmpty()) {
+            LazyRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                items(state.attachments) { att ->
+                    AttachmentChip(att, enabled = !state.isGenerating) { onRemoveAttachment(att.id) }
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+        }
+
+        // 첨부 버튼(모델 능력에 따라 노출). 문서는 모든 모델에서 동작.
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            if (state.visionActive) {
+                OutlinedButton(
+                    onClick = {
+                        pickImage.launch(
+                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
+                        )
+                    },
+                    enabled = !state.isGenerating,
+                ) { Text("🖼️ 이미지") }
+            }
+            if (state.audioActive) {
+                OutlinedButton(
+                    onClick = { pickAudio.launch("audio/*") },
+                    enabled = !state.isGenerating,
+                ) { Text("🎵 오디오") }
+            }
+            OutlinedButton(
+                onClick = { pickDocument.launch("text/*") },
+                enabled = !state.isGenerating,
+            ) { Text("📄 문서") }
+        }
+
+        Spacer(Modifier.height(8.dp))
+
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             OutlinedTextField(
                 value = input,
@@ -421,10 +532,55 @@ private fun ChatArea(
                         onSend(input)
                         input = ""
                     },
-                    enabled = input.isNotBlank(),
+                    // 텍스트가 없어도 첨부가 있으면 전송 가능.
+                    enabled = input.isNotBlank() || state.attachments.isNotEmpty(),
                     modifier = Modifier.padding(start = 8.dp),
                 ) { Text("전송") }
             }
+        }
+    }
+}
+
+/** 전송 대기 중 첨부 1개를 나타내는 칩. 이미지 첨부는 축소 미리보기를 함께 보여준다. */
+@Composable
+private fun AttachmentChip(att: AttachmentUi, enabled: Boolean, onRemove: () -> Unit) {
+    Surface(
+        color = MaterialTheme.colorScheme.secondaryContainer,
+        shape = RoundedCornerShape(8.dp),
+    ) {
+        Row(
+            Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            val preview = att.preview
+            if (att.kind == AttachmentKind.IMAGE && preview != null) {
+                Image(
+                    bitmap = preview.asImageBitmap(),
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.size(28.dp).clip(RoundedCornerShape(4.dp)),
+                )
+            } else {
+                Text(
+                    when (att.kind) {
+                        AttachmentKind.IMAGE -> "🖼️"
+                        AttachmentKind.AUDIO -> "🎵"
+                        AttachmentKind.DOCUMENT -> "📄"
+                    },
+                )
+            }
+            Text(
+                att.label,
+                style = MaterialTheme.typography.labelMedium,
+                maxLines = 1,
+                modifier = Modifier.widthIn(max = 140.dp),
+            )
+            TextButton(
+                onClick = onRemove,
+                enabled = enabled,
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(4.dp),
+            ) { Text("✕") }
         }
     }
 }

@@ -63,6 +63,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.isroot.lmbridgesample.data.MessageStatus
 import com.isroot.lmbridgesample.ui.theme.LMBridgeSampleTheme
 import kotlinx.coroutines.launch
 
@@ -616,9 +617,17 @@ private fun MessageBubble(msg: ChatMessage) {
                     Spacer(Modifier.height(8.dp))
                 }
                 Text(
-                    text = msg.text.ifEmpty { "…" },
+                    text = msg.text.ifEmpty { if (msg.status == MessageStatus.INTERRUPTED) "(응답 없음)" else "…" },
                     style = MaterialTheme.typography.bodyMedium,
                 )
+                if (msg.status == MessageStatus.INTERRUPTED) {
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        text = "⏹ 중단됨",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                    )
+                }
                 msg.stats?.let {
                     Spacer(Modifier.height(6.dp))
                     Text(

@@ -8,6 +8,7 @@
 - GitHub Pages Maven 저장소에서 `com.isroot:lmbridge:0.3.0` 의존성 해석
 - 모델 다운로드(진행률 · 무결성 검증) → 엔진 초기화 → **스트리밍 대화**
 - `LMBridgeClient` / `Chat` / `GenerationChunk` / `ModelDownloadManager` 실사용
+- **대화 저장(Room)** — 앱을 다시 켜도 채팅방·대화가 남고, `ChatConfig.history`로 모델 문맥까지 복원
 
 ## 라이브러리 연동 지점
 
@@ -82,8 +83,24 @@ private val modelIsGated = false
 |------|------|
 | `ChatViewModel.kt` | 다운로드 → 초기화 → 대화 → 해제 전 과정 |
 | `MainActivity.kt` | Jetpack Compose UI(설정 화면 · 채팅 화면) |
+| `data/` | 대화 저장소 — `ChatDatabase`(Room) · `ChatDao` · `ChatStore`(쓰기 직렬화 큐) |
+| `app/schemas/` | Room 스키마 JSON(마이그레이션 검토용, 버전 관리 대상) |
+
+## 대화 저장
+
+- 채팅방(`conversations`)과 말풍선(`messages`)을 모델별로 Room에 저장합니다. 모델을 로드하면
+  저장된 방을 읽어 오고, 마지막으로 쓰던 방을 엽니다. 방의 최근 20개 메시지는 세션 히스토리로
+  주입돼 모델이 이전 대화를 기억합니다.
+- 응답은 생성 시작 시 `STREAMING` 상태로 넣고, 스트리밍 중에는 0.5초 간격으로 묶어 갱신한 뒤
+  완료(`COMPLETE`)·오류(`ERROR`)·중지(`INTERRUPTED`)로 확정합니다. 생성 도중 앱이 종료되면
+  다음 실행에서 `INTERRUPTED`로 정리되어 "⏹ 중단됨"으로 표시됩니다.
+- 모든 DB 작업은 `ChatStore`의 단일 큐로 직렬화되어 순서가 보장되며, 프로세스 수명 스코프에서
+  실행되므로 화면이 사라지는 순간의 마지막 기록도 남습니다.
+- 첨부 미디어(이미지·오디오 바이트)는 저장하지 않고, 말풍선의 첨부 요약 텍스트만 남깁니다.
+- 샘플이므로 암호화(SQLCipher)·백업 제외 규칙은 적용하지 않았습니다(`allowBackup="true"`).
 
 ## 요구 사항
 
 - Android **API 26+**
+- Kotlin 2.4.21 · AGP 8.13.2 · Gradle 8.14.4 · KSP 2.3.12 · Room 2.8.5
 - 모델 저장을 위한 충분한 저장공간(약 600MB+)

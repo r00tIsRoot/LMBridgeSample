@@ -18,6 +18,9 @@ import com.isroot.lmbridge.models.ChatMessage as HistoryMessage
 import com.isroot.lmbridge.models.GenerationChunk
 import com.isroot.lmbridge.models.GenerationStats
 import com.isroot.lmbridge.models.MultimodalInput
+import com.isroot.lmbridgesample.data.ChatStore
+import com.isroot.lmbridgesample.data.MessageStatus
+import com.isroot.lmbridgesample.data.StoredConversation
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.withContext
@@ -27,6 +30,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.io.File
+import java.util.UUID
 
 /** 앱이 그리는 최상위 화면. */
 enum class Screen { ModelSelect, Downloading, Chat }
@@ -38,12 +42,17 @@ enum class Role { USER, ASSISTANT }
  *
  * @property thought 모델의 추론(thinking) 텍스트. 답변과 분리된 채널로 오며, 추론 모델에서만 채워진다.
  * @property stats 응답 완료 후 표시하는 처리 속도 요약(어시스턴트 말풍선만).
+ * @property status 생성 상태. 저장된 대화를 복원할 때 중단/오류 응답을 구분하는 데 쓴다.
+ * @property id DB 행 id(UUID). 스트리밍 중 같은 행을 덮어쓰기 위해 클라이언트에서 만든다.
  */
 data class ChatMessage(
     val role: Role,
     val text: String,
     val thought: String = "",
     val stats: String? = null,
+    val status: MessageStatus = MessageStatus.COMPLETE,
+    val id: String = UUID.randomUUID().toString(),
+    val createdAt: Long = System.currentTimeMillis(),
 )
 
 /** 첨부 종류. */
@@ -115,11 +124,15 @@ data class UiState(
  *    화면에 보이던 대화 기록(transcript)은 메모리에 남겨 다시 그 모델을 고르면 복원한다.
  *    세션을 다시 열 때 그 기록을 [ChatConfig.history]로 주입하므로, 모델/방을 왕복해도
  *    모델이 이전 턴을 "기억"한다.
+ *  - 방과 말풍선은 [ChatStore](Room)에 기록돼 앱을 다시 켜도 남는다. 메모리의 방 목록은 화면용
+ *    캐시이고, 모델을 처음 로드할 때 DB에서 채운다. 스트리밍 중에는 [PERSIST_INTERVAL_MS]
+ *    간격으로 묶어 저장하고, 완료·오류·중단 시 최종 상태를 기록한다.
  */
 class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     private val appContext: Application = app
     private val chatSystemPrompt = "너는 친절하고 간결한 한국어 도우미야."
+    private val store = ChatStore.get(app)
 
     // 다운로드 전용 클라이언트: 어떤 모델을 로드하든 무관하게 models(ModelDownloadManager)만 쓴다.
     // initialize()를 호출하지 않으므로 네이티브 자원은 점유하지 않는다.
@@ -137,12 +150,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         var title: String,
         val messages: MutableList<ChatMessage> = mutableListOf(),
         var chat: Chat? = null,
+        var updatedAt: Long = System.currentTimeMillis(),
     )
 
-    // 모델별 채팅방(전환해도 기록 유지). key = SampleModel.key.
+    // 모델별 채팅방(전환해도 기록 유지). key = SampleModel.key. DB([store])의 화면용 캐시.
     private val roomsByModel = linkedMapOf<String, MutableList<Room>>()
     private var activeRoomId: String? = null
-    private var roomCounter = 0
     private var generateJob: Job? = null
     private var downloadJob: Job? = null
 
@@ -329,10 +342,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 client.initialize() // suspend, 멱등
                 val rooms = roomsByModel.getOrPut(key) { mutableListOf() }
-                if (rooms.isEmpty()) rooms.add(newRoom())
-                val first = rooms.first()
-                activeRoomId = first.id
-                bindSession(client, first) // 활성 방에만 세션을 연다(엔진당 1개 제약)
+                if (rooms.isEmpty()) rooms.addAll(store.load(key).map(::toRoom)) // 저장된 대화 복원
+                if (rooms.isEmpty()) rooms.add(newRoom(key))
+                val recent = rooms.maxBy { it.updatedAt } // 마지막으로 쓰던 방부터 연다
+                activeRoomId = recent.id
+                bindSession(client, recent) // 활성 방에만 세션을 연다(엔진당 1개 제약)
                 _uiState.update { it.copy(preparing = false) }
                 renderChat()
             } catch (e: Throwable) {
@@ -402,7 +416,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
      */
     private fun historyOf(room: Room): List<HistoryMessage> =
         room.messages
-            .filter { it.text.isNotBlank() }
+            .filter { it.text.isNotBlank() && it.status != MessageStatus.ERROR }
             .takeLast(MAX_HISTORY_MESSAGES)
             .map {
                 when (it.role) {
@@ -438,10 +452,30 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun currentRoom(): Room? = activeRooms()?.firstOrNull { it.id == activeRoomId }
 
-    private fun newRoom(): Room {
-        roomCounter += 1
-        return Room(id = "room-$roomCounter", title = "새 채팅 $roomCounter")
+    /** 새 방을 만들고 DB에 기록한다. 번호는 그 모델의 방 개수 기준. */
+    private fun newRoom(modelKey: String): Room {
+        val number = (roomsByModel[modelKey]?.size ?: 0) + 1
+        val room = Room(id = UUID.randomUUID().toString(), title = "$NEW_ROOM_TITLE $number")
+        store.createConversation(room.id, modelKey, room.title)
+        return room
     }
+
+    private fun toRoom(stored: StoredConversation) = Room(
+        id = stored.conversation.id,
+        title = stored.conversation.title,
+        messages = stored.messages.map {
+            ChatMessage(
+                role = it.role,
+                text = it.text,
+                thought = it.thought,
+                stats = it.stats,
+                status = it.status,
+                id = it.id,
+                createdAt = it.createdAt,
+            )
+        }.toMutableList(),
+        updatedAt = stored.conversation.updatedAt,
+    )
 
     /** 현재 모델에 새 채팅방을 만들고 활성화한다. 세션은 새 방으로 옮겨진다(엔진당 1개 제약). */
     fun createRoom() {
@@ -453,7 +487,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         _uiState.update { it.copy(preparing = true) }
         viewModelScope.launch {
             try {
-                val room = newRoom()
+                val room = newRoom(key)
                 roomsByModel.getOrPut(key) { mutableListOf() }.add(room)
                 bindSession(client, room) // 이전 활성 세션을 닫고 새 방에 세션을 연다
                 activeRoomId = room.id
@@ -489,6 +523,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     /** 채팅방 삭제. 마지막 방을 지우면 빈 방 하나를 새로 만든다. 네이티브 close/newChat은 off-main. */
     fun deleteRoom(id: String) {
         val client = activeClient ?: return
+        val key = activeModelKey ?: return
         if (roomBusy || _uiState.value.isGenerating || _uiState.value.preparing) return
         val list = activeRooms() ?: return
         val room = list.firstOrNull { it.id == id } ?: return
@@ -502,8 +537,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 val closing = room.chat
                 room.chat = null
                 list.remove(room)
+                store.deleteConversation(room.id)
                 withContext(Dispatchers.Default) { runCatching { closing?.close() } }
-                if (list.isEmpty()) list.add(newRoom())
+                if (list.isEmpty()) list.add(newRoom(key))
                 if (wasActive) {
                     val next = list.first()
                     activeRoomId = next.id
@@ -672,11 +708,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         // 사용자 말풍선에는 첨부 요약 줄 + 프롬프트를 함께 보여준다.
         val summary = attachments.joinToString("") { "${it.kind.icon()} ${it.label}\n" }
         val userText = (summary + prompt).trimEnd().ifBlank { summary.trim() }
-        room.messages.add(ChatMessage(Role.USER, userText))
-        if (room.title.startsWith("새 채팅")) {
+        addMessage(room, ChatMessage(Role.USER, userText))
+        if (room.title.startsWith(NEW_ROOM_TITLE)) {
             room.title = prompt.ifBlank { attachments.firstOrNull()?.label ?: "첨부" }.take(18)
+            store.rename(room.id, room.title)
         }
-        room.messages.add(ChatMessage(Role.ASSISTANT, ""))
+        addMessage(room, ChatMessage(Role.ASSISTANT, "", status = MessageStatus.STREAMING))
 
         // 첨부는 소비했으므로 비운다.
         clearAttachmentsInternal()
@@ -700,45 +737,74 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
         val builder = StringBuilder()
         val thought = StringBuilder()
+        var lastPersistAt = 0L
+
+        // 스트리밍 중 저장은 PERSIST_INTERVAL_MS 간격으로 묶는다(토큰마다 쓰지 않음).
+        fun persistThrottled() {
+            val now = System.currentTimeMillis()
+            if (now - lastPersistAt >= PERSIST_INTERVAL_MS) {
+                lastPersistAt = now
+                persistLastAssistant(room)
+            }
+        }
+
         generateJob = viewModelScope.launch {
-            stream.collect { chunk ->
-                when (chunk) {
-                    is GenerationChunk.Token -> {
-                        builder.append(chunk.text)
-                        updateLastAssistant(room) { it.copy(text = builder.toString()) }
-                        renderMessages()
-                    }
-
-                    is GenerationChunk.Thought -> {
-                        thought.append(chunk.text)
-                        updateLastAssistant(room) { it.copy(thought = thought.toString()) }
-                        renderMessages()
-                    }
-
-                    is GenerationChunk.ToolCall -> {
-                        builder.append("\n[도구 호출: ${chunk.name} ${chunk.argsJson}]")
-                        updateLastAssistant(room) { it.copy(text = builder.toString()) }
-                        renderMessages()
-                    }
-
-                    is GenerationChunk.Done -> {
-                        val stats = runCatching { chat.stats() }.getOrNull()?.let(::formatStats)
-                        updateLastAssistant(room) { it.copy(stats = stats) }
-                        renderMessages()
-                        _uiState.update { it.copy(isGenerating = false) }
-                    }
-
-                    is GenerationChunk.Error -> {
-                        updateLastAssistant(room) {
-                            it.copy(text = builder.toString() + "\n⚠️ ${chunk.error.message}")
+            try {
+                stream.collect { chunk ->
+                    when (chunk) {
+                        is GenerationChunk.Token -> {
+                            builder.append(chunk.text)
+                            updateLastAssistant(room) { it.copy(text = builder.toString()) }
+                            renderMessages()
+                            persistThrottled()
                         }
-                        renderMessages()
-                        _uiState.update { it.copy(isGenerating = false) }
+
+                        is GenerationChunk.Thought -> {
+                            thought.append(chunk.text)
+                            updateLastAssistant(room) { it.copy(thought = thought.toString()) }
+                            renderMessages()
+                            persistThrottled()
+                        }
+
+                        is GenerationChunk.ToolCall -> {
+                            builder.append("\n[도구 호출: ${chunk.name} ${chunk.argsJson}]")
+                            updateLastAssistant(room) { it.copy(text = builder.toString()) }
+                            renderMessages()
+                            persistThrottled()
+                        }
+
+                        is GenerationChunk.Done -> {
+                            val stats = runCatching { chat.stats() }.getOrNull()?.let(::formatStats)
+                            updateLastAssistant(room) { it.copy(stats = stats, status = MessageStatus.COMPLETE) }
+                            persistLastAssistant(room)
+                            renderMessages()
+                            _uiState.update { it.copy(isGenerating = false) }
+                        }
+
+                        is GenerationChunk.Error -> {
+                            updateLastAssistant(room) {
+                                it.copy(
+                                    text = builder.toString() + "\n⚠️ ${chunk.error.message}",
+                                    status = MessageStatus.ERROR,
+                                )
+                            }
+                            persistLastAssistant(room)
+                            renderMessages()
+                            _uiState.update { it.copy(isGenerating = false) }
+                        }
                     }
                 }
+            } finally {
+                // 중지·모델 전환·ViewModel 해제로 Done 없이 끝났다면 중단으로 확정한다.
+                // (취소된 코루틴에서도 동작하도록 저장 호출은 suspend가 아니다.)
+                if (lastAssistant(room)?.status == MessageStatus.STREAMING) {
+                    updateLastAssistant(room) { it.copy(status = MessageStatus.INTERRUPTED) }
+                    persistLastAssistant(room)
+                    renderMessages()
+                }
+                // 스트림이 (취소 등으로) Done 없이 끝나도 상태를 되돌린다.
+                _uiState.update { it.copy(isGenerating = false) }
             }
-            // 스트림이 (취소 등으로) Done 없이 끝나도 상태를 되돌린다.
-            _uiState.update { it.copy(isGenerating = false) }
         }
     }
 
@@ -749,9 +815,26 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         _uiState.update { it.copy(isGenerating = false) }
     }
 
+    private fun addMessage(room: Room, message: ChatMessage) {
+        room.messages.add(message)
+        room.updatedAt = System.currentTimeMillis()
+        store.saveMessage(room.id, room.messages.lastIndex, message)
+    }
+
+    private fun lastAssistant(room: Room): ChatMessage? =
+        room.messages.lastOrNull { it.role == Role.ASSISTANT }
+
     private fun updateLastAssistant(room: Room, transform: (ChatMessage) -> ChatMessage) {
         val idx = room.messages.indexOfLast { it.role == Role.ASSISTANT }
         if (idx >= 0) room.messages[idx] = transform(room.messages[idx])
+    }
+
+    private fun persistLastAssistant(room: Room) {
+        val idx = room.messages.indexOfLast { it.role == Role.ASSISTANT }
+        if (idx >= 0) {
+            room.updatedAt = System.currentTimeMillis()
+            store.saveMessage(room.id, idx, room.messages[idx])
+        }
     }
 
     /** 처리 속도 요약. 벤치마크 수치가 없으면 컨텍스트 토큰 수만 표시한다. */
@@ -789,5 +872,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private companion object {
         /** 세션 재생성 시 주입할 최대 히스토리 메시지 수(컨텍스트 한도 보호). */
         const val MAX_HISTORY_MESSAGES = 20
+
+        /** 스트리밍 중 DB 저장 간격. */
+        const val PERSIST_INTERVAL_MS = 500L
+
+        const val NEW_ROOM_TITLE = "새 채팅"
     }
 }

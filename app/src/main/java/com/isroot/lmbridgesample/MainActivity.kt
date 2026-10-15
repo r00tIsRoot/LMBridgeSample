@@ -57,6 +57,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -603,11 +604,30 @@ private fun MessageBubble(msg: ChatMessage) {
             ),
             modifier = Modifier.widthIn(max = 300.dp),
         ) {
-            Text(
-                text = msg.text.ifEmpty { "…" },
-                modifier = Modifier.padding(12.dp),
-                style = MaterialTheme.typography.bodyMedium,
-            )
+            Column(Modifier.padding(12.dp)) {
+                if (msg.thought.isNotEmpty()) {
+                    // 추론(thinking) 과정은 답변과 구분되도록 흐리게 표시
+                    Text(
+                        text = "💭 ${msg.thought.trim()}",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontStyle = FontStyle.Italic,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                    )
+                    Spacer(Modifier.height(8.dp))
+                }
+                Text(
+                    text = msg.text.ifEmpty { "…" },
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                msg.stats?.let {
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        text = it,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                    )
+                }
+            }
         }
     }
 }

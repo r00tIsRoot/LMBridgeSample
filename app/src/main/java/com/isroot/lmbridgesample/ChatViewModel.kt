@@ -14,7 +14,9 @@ import com.isroot.lmbridge.download.ModelDownloadManager
 import com.isroot.lmbridge.download.ModelDownloadManager.DownloadStatus
 import com.isroot.lmbridge.models.Chat
 import com.isroot.lmbridge.models.ChatConfig
+import com.isroot.lmbridge.models.ChatMessage as HistoryMessage
 import com.isroot.lmbridge.models.GenerationChunk
+import com.isroot.lmbridge.models.GenerationStats
 import com.isroot.lmbridge.models.MultimodalInput
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -31,7 +33,18 @@ enum class Screen { ModelSelect, Downloading, Chat }
 
 enum class Role { USER, ASSISTANT }
 
-data class ChatMessage(val role: Role, val text: String)
+/**
+ * 말풍선 1개.
+ *
+ * @property thought 모델의 추론(thinking) 텍스트. 답변과 분리된 채널로 오며, 추론 모델에서만 채워진다.
+ * @property stats 응답 완료 후 표시하는 처리 속도 요약(어시스턴트 말풍선만).
+ */
+data class ChatMessage(
+    val role: Role,
+    val text: String,
+    val thought: String = "",
+    val stats: String? = null,
+)
 
 /** 첨부 종류. */
 enum class AttachmentKind { IMAGE, AUDIO, DOCUMENT }
@@ -100,7 +113,8 @@ data class UiState(
  *    메모리 한계상 **한 번에 하나의 모델만** 로드하며, 모델을 바꾸면 이전 클라이언트를 release한다.
  *  - 채팅방은 로드된 모델에 종속된 [Chat] 세션이다. 모델을 바꾸면 그 세션들은 닫히지만,
  *    화면에 보이던 대화 기록(transcript)은 메모리에 남겨 다시 그 모델을 고르면 복원한다.
- *    단 네이티브 대화 문맥은 초기화되므로, 모델을 왕복한 뒤에는 모델이 이전 턴을 "기억"하지 않는다.
+ *    세션을 다시 열 때 그 기록을 [ChatConfig.history]로 주입하므로, 모델/방을 왕복해도
+ *    모델이 이전 턴을 "기억"한다.
  */
 class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
@@ -308,6 +322,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     if (sm.audio) setAudioBackend(LMBridge.Backend.CPU)
                 }
                 .setMaxNumTokens(8500)
+                .setEnableBenchmark(true) // 응답마다 tokens/s를 말풍선에 표시
                 .build()
             activeClient = client
             activeModelKey = key
@@ -368,17 +383,33 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
      * time"). 그래서 방마다 세션을 동시에 열어둘 수 없다. 살아있는 세션을 모두 닫은 뒤
      * target 방에만 새 세션을 연다. 네이티브 close/createConversation은 블로킹이라 off-main.
      *
-     * 트레이드오프: 방을 전환하면 네이티브 대화 컨텍스트가 초기화된다(화면의 대화 기록은 유지).
+     * 방을 전환하면 네이티브 대화 컨텍스트는 새로 만들어지지만, 방의 대화 기록을
+     * [ChatConfig.history]로 주입해 문맥을 복원한다.
      */
     private suspend fun bindSession(client: LMBridgeClient, target: Room) {
         val rooms = activeRooms() ?: return
         val toClose = rooms.mapNotNull { r -> r.chat?.also { r.chat = null } }
         val fresh = withContext(Dispatchers.Default) {
             toClose.forEach { runCatching { it.close() } }
-            client.newChat(ChatConfig(systemInstruction = chatSystemPrompt))
+            client.newChat(ChatConfig(systemInstruction = chatSystemPrompt, history = historyOf(target)))
         }
         target.chat = fresh
     }
+
+    /**
+     * 방의 화면 기록을 세션 히스토리로 변환한다. 빈 말풍선(생성 중단 등)은 제외하고, 컨텍스트
+     * 한도를 넘지 않도록 최근 [MAX_HISTORY_MESSAGES]개만 주입한다.
+     */
+    private fun historyOf(room: Room): List<HistoryMessage> =
+        room.messages
+            .filter { it.text.isNotBlank() }
+            .takeLast(MAX_HISTORY_MESSAGES)
+            .map {
+                when (it.role) {
+                    Role.USER -> HistoryMessage.user(it.text)
+                    Role.ASSISTANT -> HistoryMessage.model(it.text)
+                }
+            }
 
     /** 활성 자원을 필드에서 떼어내고(메인, 저비용) 닫아야 할 대상만 돌려준다. */
     private fun detachActiveResources(): Pair<List<Chat>, LMBridgeClient?> {
@@ -668,26 +699,39 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
 
         val builder = StringBuilder()
+        val thought = StringBuilder()
         generateJob = viewModelScope.launch {
             stream.collect { chunk ->
                 when (chunk) {
                     is GenerationChunk.Token -> {
                         builder.append(chunk.text)
-                        replaceLastAssistant(room, builder.toString())
+                        updateLastAssistant(room) { it.copy(text = builder.toString()) }
+                        renderMessages()
+                    }
+
+                    is GenerationChunk.Thought -> {
+                        thought.append(chunk.text)
+                        updateLastAssistant(room) { it.copy(thought = thought.toString()) }
                         renderMessages()
                     }
 
                     is GenerationChunk.ToolCall -> {
                         builder.append("\n[도구 호출: ${chunk.name} ${chunk.argsJson}]")
-                        replaceLastAssistant(room, builder.toString())
+                        updateLastAssistant(room) { it.copy(text = builder.toString()) }
                         renderMessages()
                     }
 
-                    is GenerationChunk.Done ->
+                    is GenerationChunk.Done -> {
+                        val stats = runCatching { chat.stats() }.getOrNull()?.let(::formatStats)
+                        updateLastAssistant(room) { it.copy(stats = stats) }
+                        renderMessages()
                         _uiState.update { it.copy(isGenerating = false) }
+                    }
 
                     is GenerationChunk.Error -> {
-                        replaceLastAssistant(room, builder.toString() + "\n⚠️ ${chunk.error.message}")
+                        updateLastAssistant(room) {
+                            it.copy(text = builder.toString() + "\n⚠️ ${chunk.error.message}")
+                        }
                         renderMessages()
                         _uiState.update { it.copy(isGenerating = false) }
                     }
@@ -705,10 +749,17 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         _uiState.update { it.copy(isGenerating = false) }
     }
 
-    private fun replaceLastAssistant(room: Room, text: String) {
+    private fun updateLastAssistant(room: Room, transform: (ChatMessage) -> ChatMessage) {
         val idx = room.messages.indexOfLast { it.role == Role.ASSISTANT }
-        if (idx >= 0) room.messages[idx] = room.messages[idx].copy(text = text)
+        if (idx >= 0) room.messages[idx] = transform(room.messages[idx])
     }
+
+    /** 처리 속도 요약. 벤치마크 수치가 없으면 컨텍스트 토큰 수만 표시한다. */
+    private fun formatStats(s: GenerationStats): String = buildList {
+        s.decodeTokensPerSecond?.let { add("%.1f tok/s".format(it)) }
+        s.timeToFirstTokenSeconds?.let { add("첫 토큰 %.1fs".format(it)) }
+        add("컨텍스트 ${s.contextTokens} 토큰")
+    }.joinToString(" · ")
 
     // ── 렌더링 헬퍼 ──────────────────────────────────────────────────────────
 
@@ -733,5 +784,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
         downloadClient.release()
         super.onCleared()
+    }
+
+    private companion object {
+        /** 세션 재생성 시 주입할 최대 히스토리 메시지 수(컨텍스트 한도 보호). */
+        const val MAX_HISTORY_MESSAGES = 20
     }
 }

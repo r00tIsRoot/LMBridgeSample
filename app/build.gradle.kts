@@ -31,11 +31,14 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    kotlinOptions {
-        jvmTarget = "17"
-    }
     buildFeatures {
         compose = true
+    }
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
     }
 }
 
@@ -43,7 +46,7 @@ dependencies {
     // ── LMBridge (GitHub Pages Maven 저장소에서 해석) ──
     // litertlm·coroutines 등 라이브러리의 런타임 의존성은 AAR + Gradle Module
     // Metadata를 통해 자동으로 따라오므로 여기서 따로 선언할 필요가 없다.
-    implementation("com.isroot:lmbridge:0.2.7")
+    implementation("com.isroot:lmbridge:0.3.0")
 
     // 앱이 직접 Flow/코루틴을 사용하므로 컴파일 클래스패스에 필요.
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")

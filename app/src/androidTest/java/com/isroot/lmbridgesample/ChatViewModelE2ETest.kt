@@ -12,7 +12,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 
 /**
- * [ChatViewModel] 실엔진 E2E — LMBridge 0.2.6 적용분(히스토리 복원·처리 속도 통계) 검증.
+ * [ChatViewModel] 실엔진 E2E — LMBridge 히스토리 복원·처리 속도 통계(0.2.6+) 검증.
  *
  * 모델은 앱이 이미 내려받아 둔 것을 사용한다(인자 `modelKey`, 기본 LFM2.5-1.2B-JP).
  * 받아둔 모델이 없으면 테스트를 건너뛴다.

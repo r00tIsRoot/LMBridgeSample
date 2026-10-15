@@ -5,7 +5,7 @@
 
 ## 무엇을 보여주나
 
-- GitHub Pages Maven 저장소에서 `com.isroot:lmbridge:0.2.1` 의존성 해석
+- GitHub Pages Maven 저장소에서 `com.isroot:lmbridge:0.3.0` 의존성 해석
 - 모델 다운로드(진행률 · 무결성 검증) → 엔진 초기화 → **스트리밍 대화**
 - `LMBridgeClient` / `Chat` / `GenerationChunk` / `ModelDownloadManager` 실사용
 
@@ -29,9 +29,12 @@ dependencyResolutionManagement {
 
 ```kotlin
 dependencies {
-    implementation("com.isroot:lmbridge:0.2.1")
+    implementation("com.isroot:lmbridge:0.3.0")
 }
 ```
+
+> LMBridge 0.3.0은 litertlm 0.18(kotlin-stdlib 2.4)에 의존하므로 **앱의 Kotlin 플러그인이 2.3 이상**
+> 이어야 합니다. 이 샘플은 Kotlin·Compose 컴파일러 플러그인 2.4.21을 사용합니다.
 
 litertlm·coroutines 등 라이브러리 런타임 의존성은 AAR + Gradle Module Metadata를 통해
 자동으로 따라옵니다.

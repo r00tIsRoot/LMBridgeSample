@@ -86,6 +86,13 @@ private val modelIsGated = false
 | `data/` | 대화 저장소 — `ChatDatabase`(Room) · `ChatDao` · `ChatStore`(쓰기 직렬화 큐) |
 | `app/schemas/` | Room 스키마 JSON(마이그레이션 검토용, 버전 관리 대상) |
 
+## 채팅방 세션
+
+- litertlm 0.18부터 한 엔진에서 대화 세션을 여러 개 동시에 열 수 있어, 채팅방마다 세션을 열어 둡니다.
+  방을 오가도 KV 캐시가 유지되어 다시 prefill하지 않습니다.
+- 열린 세션 수는 기기 RAM에 따라 제한합니다(5GB 미만 2개 · 9GB 미만 3개 · 그 이상 4개). 넘치면 가장
+  오래 안 쓴 방의 세션을 닫고, 그 방을 다시 열 때 대화 기록을 히스토리로 주입해 복원합니다.
+
 ## 대화 저장
 
 - 채팅방(`conversations`)과 말풍선(`messages`)을 모델별로 Room에 저장합니다. 모델을 로드하면

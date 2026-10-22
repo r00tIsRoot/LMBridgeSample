@@ -1,5 +1,6 @@
 package com.isroot.lmbridgesample
 
+import android.app.ActivityManager
 import android.app.Application
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -120,10 +121,12 @@ data class UiState(
  * 설계 메모:
  *  - [LMBridgeClient]는 build 시점에 모델이 고정되고 네이티브 자원을 점유한다. 온디바이스
  *    메모리 한계상 **한 번에 하나의 모델만** 로드하며, 모델을 바꾸면 이전 클라이언트를 release한다.
- *  - 채팅방은 로드된 모델에 종속된 [Chat] 세션이다. 모델을 바꾸면 그 세션들은 닫히지만,
- *    화면에 보이던 대화 기록(transcript)은 메모리에 남겨 다시 그 모델을 고르면 복원한다.
- *    세션을 다시 열 때 그 기록을 [ChatConfig.history]로 주입하므로, 모델/방을 왕복해도
- *    모델이 이전 턴을 "기억"한다.
+ *  - 채팅방은 로드된 모델에 종속된 [Chat] 세션이다. litertlm 0.18+는 한 엔진에서 세션을 여러 개
+ *    동시에 열 수 있으므로, 방마다 세션을 열어 두어 방을 오가도 KV 캐시를 그대로 재사용한다
+ *    (재-prefill 없음). 메모리 보호를 위해 열린 세션 수는 [maxOpenSessions]로 제한하고, 넘치면
+ *    가장 오래 안 쓴 방의 세션부터 닫는다.
+ *  - 모델을 바꾸거나 세션이 닫힌 방은, 다시 열 때 화면 기록(transcript)을 [ChatConfig.history]로
+ *    주입해 모델이 이전 턴을 "기억"하게 한다.
  *  - 방과 말풍선은 [ChatStore](Room)에 기록돼 앱을 다시 켜도 남는다. 메모리의 방 목록은 화면용
  *    캐시이고, 모델을 처음 로드할 때 DB에서 채운다. 스트리밍 중에는 [PERSIST_INTERVAL_MS]
  *    간격으로 묶어 저장하고, 완료·오류·중단 시 최종 상태를 기록한다.
@@ -151,6 +154,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val messages: MutableList<ChatMessage> = mutableListOf(),
         var chat: Chat? = null,
         var updatedAt: Long = System.currentTimeMillis(),
+        /** 마지막으로 활성화된 시각(세션 LRU 정리 기준). */
+        var lastBoundAt: Long = 0L,
     )
 
     // 모델별 채팅방(전환해도 기록 유지). key = SampleModel.key. DB([store])의 화면용 캐시.
@@ -346,7 +351,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 if (rooms.isEmpty()) rooms.add(newRoom(key))
                 val recent = rooms.maxBy { it.updatedAt } // 마지막으로 쓰던 방부터 연다
                 activeRoomId = recent.id
-                bindSession(client, recent) // 활성 방에만 세션을 연다(엔진당 1개 제약)
+                bindSession(client, recent) // 마지막으로 쓰던 방의 세션을 연다
                 _uiState.update { it.copy(preparing = false) }
                 renderChat()
             } catch (e: Throwable) {
@@ -391,23 +396,26 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * 활성 세션을 [target] 방으로 옮긴다.
+     * [target] 방을 활성화한다.
      *
-     * litertlm 엔진은 **엔진당 대화 세션을 1개만** 허용한다("Only one session is supported at a
-     * time"). 그래서 방마다 세션을 동시에 열어둘 수 없다. 살아있는 세션을 모두 닫은 뒤
-     * target 방에만 새 세션을 연다. 네이티브 close/createConversation은 블로킹이라 off-main.
-     *
-     * 방을 전환하면 네이티브 대화 컨텍스트는 새로 만들어지지만, 방의 대화 기록을
-     * [ChatConfig.history]로 주입해 문맥을 복원한다.
+     * 이미 세션이 열린 방이면 그대로 재사용한다(KV 캐시 유지 → 전환 직후에도 새 입력만 prefill).
+     * 세션이 없으면 방의 대화 기록을 [ChatConfig.history]로 주입해 새로 연다. 그 뒤 열린 세션이
+     * [maxOpenSessions]를 넘으면 가장 오래 안 쓴 방의 세션부터 닫는다(기록은 남으므로 다시 열 때 복원).
+     * 네이티브 close/createConversation은 블로킹이라 off-main.
      */
     private suspend fun bindSession(client: LMBridgeClient, target: Room) {
         val rooms = activeRooms() ?: return
-        val toClose = rooms.mapNotNull { r -> r.chat?.also { r.chat = null } }
+        target.lastBoundAt = System.nanoTime()
+        val evicted = rooms.filter { it.chat != null && it !== target }
+            .sortedByDescending { it.lastBoundAt }
+            .drop(maxOpenSessions - 1)
+            .mapNotNull { r -> r.chat?.also { r.chat = null } }
+        val history = if (target.chat == null) historyOf(target) else null
         val fresh = withContext(Dispatchers.Default) {
-            toClose.forEach { runCatching { it.close() } }
-            client.newChat(ChatConfig(systemInstruction = chatSystemPrompt, history = historyOf(target)))
+            evicted.forEach { runCatching { it.close() } }
+            history?.let { client.newChat(ChatConfig(systemInstruction = chatSystemPrompt, history = it)) }
         }
-        target.chat = fresh
+        fresh?.let { target.chat = it }
     }
 
     /**
@@ -477,7 +485,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         updatedAt = stored.conversation.updatedAt,
     )
 
-    /** 현재 모델에 새 채팅방을 만들고 활성화한다. 세션은 새 방으로 옮겨진다(엔진당 1개 제약). */
+    /** 현재 모델에 새 채팅방을 만들고 활성화한다(새 방에 세션을 연다). */
     fun createRoom() {
         val client = activeClient ?: return
         val key = activeModelKey ?: return
@@ -489,7 +497,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 val room = newRoom(key)
                 roomsByModel.getOrPut(key) { mutableListOf() }.add(room)
-                bindSession(client, room) // 이전 활성 세션을 닫고 새 방에 세션을 연다
+                bindSession(client, room) // 새 방에 세션을 연다(상한을 넘으면 오래된 방 세션 정리)
                 activeRoomId = room.id
             } finally {
                 roomBusy = false
@@ -499,7 +507,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** 채팅방 선택. 세션을 대상 방으로 옮긴다(전환 시 네이티브 컨텍스트는 초기화). */
+    /** 채팅방 선택. 대상 방의 세션이 열려 있으면 그대로 이어 쓴다(닫혀 있으면 기록으로 복원). */
     fun selectRoom(id: String) {
         val client = activeClient ?: return
         if (id == activeRoomId) return
@@ -533,7 +541,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             try {
                 val wasActive = activeRoomId == id
-                // 비활성 방은 세션이 없어(null) 닫을 게 없고, 활성 방만 살아있는 세션을 갖는다.
+                // 세션이 닫혀 있던 방은 chat이 null이라 닫을 게 없다.
                 val closing = room.chat
                 room.chat = null
                 list.remove(room)
@@ -867,6 +875,21 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
         downloadClient.release()
         super.onCleared()
+    }
+
+    /**
+     * 동시에 열어 둘 채팅 세션 수. 세션마다 KV 캐시 메모리가 들므로 기기 RAM에 따라 정한다.
+     * (SM-A426N 4GB·Gemma 4 E2B 실측: 세션 1개 추가 시 한 턴 후 PSS 약 +30MB)
+     */
+    private val maxOpenSessions: Int = run {
+        val am = app.getSystemService(ActivityManager::class.java)
+        val mem = ActivityManager.MemoryInfo().also { am.getMemoryInfo(it) }
+        val gb = mem.totalMem / (1024L * 1024 * 1024)
+        when {
+            am.isLowRamDevice || gb < 5 -> 2
+            gb < 9 -> 3
+            else -> 4
+        }
     }
 
     private companion object {

@@ -18,6 +18,7 @@ import com.isroot.lmbridge.models.ChatConfig
 import com.isroot.lmbridge.models.ChatMessage as HistoryMessage
 import com.isroot.lmbridge.models.GenerationChunk
 import com.isroot.lmbridge.models.GenerationStats
+import com.isroot.lmbridge.models.LMBridgeError
 import com.isroot.lmbridge.models.MultimodalInput
 import com.isroot.lmbridgesample.data.ChatStore
 import com.isroot.lmbridgesample.data.MessageStatus
@@ -100,6 +101,8 @@ data class UiState(
     // 채팅
     val preparing: Boolean = false,
     val activeModelLabel: String = "",
+    // 실제로 초기화된 백엔드(폴백 시 "CPU (GPU 실패)").
+    val activeBackend: String = "",
     val rooms: List<RoomUi> = emptyList(),
     val activeRoomId: String? = null,
     val messages: List<ChatMessage> = emptyList(),
@@ -310,6 +313,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 screen = Screen.Chat,
                 preparing = true,
                 activeModelLabel = sm.label,
+                activeBackend = "",
                 isGenerating = false,
                 loadError = null,
                 // 멀티모달 능력은 로드 시작 시점에 확정(첨부 버튼 노출 판단에 사용).
@@ -324,28 +328,14 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             releaseActiveClient() // 이전 모델 자원 해제(방 기록은 유지) — 네이티브 close/release는 off-main
 
             // 멀티모달 모델은 메인 백엔드를 GPU로 둔다(대형 비전 모델의 CPU 텍스트 초기화가
-            // 메모리 한계로 실패하는 기기가 있음). 비전/오디오 인코더는 CPU로 분리한다 — 일부
-            // GPU는 이미지 샘플러(OpenCL)를 지원하지 않아 GPU 비전이 실패할 수 있기 때문.
-            // setMaxNumTokens는 호출하지 않는다 → 각 모델 번들에 내장된 최대 컨텍스트
-            // (파일명 ekvNNNN, 예: ekv4096)를 그대로 사용한다. 과거 1024 고정은 큰 문서/
-            // 오디오 입력을 총 컨텍스트(입력+출력) 1024 토큰으로 묶어버렸다.
-            val client = LMBridgeClient.Builder(appContext)
-                .setModel(sm.info)
-                .setBackend(if (sm.multimodal) LMBridge.Backend.GPU else LMBridge.Backend.CPU)
-                .apply {
-                    if (sm.vision) {
-                        setMaxNumImages(1)
-                        setVisionBackend(LMBridge.Backend.CPU)
-                    }
-                    if (sm.audio) setAudioBackend(LMBridge.Backend.CPU)
-                }
-                .setMaxNumTokens(8500)
-                .setEnableBenchmark(true) // 응답마다 tokens/s를 말풍선에 표시
-                .build()
-            activeClient = client
+            // 메모리 한계로 실패하는 기기가 있음). GPU를 쓸 수 없는 기기면 CPU로 한 번 재시도한다.
+            val preferred = if (sm.multimodal) LMBridge.Backend.GPU else LMBridge.Backend.CPU
             activeModelKey = key
             try {
-                client.initialize() // suspend, 멱등
+                val (client, backend) = initializeWithFallback(sm, preferred)
+                _uiState.update {
+                    it.copy(activeBackend = if (backend == preferred) "$backend" else "$backend ($preferred 실패)")
+                }
                 val rooms = roomsByModel.getOrPut(key) { mutableListOf() }
                 if (rooms.isEmpty()) rooms.addAll(store.load(key).map(::toRoom)) // 저장된 대화 복원
                 if (rooms.isEmpty()) rooms.add(newRoom(key))
@@ -359,18 +349,63 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 val causes = generateSequence(e.cause) { it.cause }
                     .joinToString(" ⟵ ") { "${it.javaClass.simpleName}: ${it.message}" }
                     .ifEmpty { "(원인 없음)" }
+                val hint = if (e is LMBridgeError.InvalidModel) "\n모델 파일이 손상되었습니다. 삭제 후 다시 받아 주세요." else ""
                 releaseActiveClient()
                 _uiState.update {
                     it.copy(
                         screen = Screen.ModelSelect,
                         preparing = false,
                         models = modelUiList(),
-                        loadError = "초기화 실패: ${e.message}\n원인: $causes",
+                        loadError = "초기화 실패: ${e.message}$hint\n원인: $causes",
                     )
                 }
             }
         }
     }
+
+    /**
+     * [preferred] 백엔드로 엔진을 초기화하고, 백엔드 문제([LMBridgeError.BackendUnavailable])로 실패하면
+     * CPU로 한 번 재시도한다. 모델 파일 문제([LMBridgeError.InvalidModel])는 백엔드를 바꿔도 같으므로
+     * 재시도하지 않는다. 초기화된 클라이언트(= [activeClient])와 실제 백엔드를 돌려준다.
+     */
+    private suspend fun initializeWithFallback(
+        sm: SampleModel,
+        preferred: LMBridge.Backend,
+    ): Pair<LMBridgeClient, LMBridge.Backend> {
+        val client = buildClient(sm, preferred)
+        activeClient = client
+        try {
+            client.initialize() // suspend, 멱등
+            return client to preferred
+        } catch (e: LMBridgeError.BackendUnavailable) {
+            if (preferred == LMBridge.Backend.CPU) throw e
+            Log.w("LMBridgeSample", "$preferred 초기화 실패 → CPU로 재시도", e)
+            activeClient = null
+            withContext(Dispatchers.Default) { client.release() }
+        }
+        val fallback = buildClient(sm, LMBridge.Backend.CPU)
+        activeClient = fallback
+        fallback.initialize()
+        return fallback to LMBridge.Backend.CPU
+    }
+
+    private fun buildClient(sm: SampleModel, backend: LMBridge.Backend): LMBridgeClient =
+        LMBridgeClient.Builder(appContext)
+            .setModel(sm.info)
+            .setBackend(backend)
+            .apply {
+                // 비전/오디오 인코더는 CPU로 분리한다 — 일부 GPU는 이미지 샘플러(OpenCL)를 지원하지
+                // 않아 GPU 비전이 실패할 수 있기 때문.
+                if (sm.vision) {
+                    setMaxNumImages(1)
+                    setVisionBackend(LMBridge.Backend.CPU)
+                }
+                if (sm.audio) setAudioBackend(LMBridge.Backend.CPU)
+            }
+            .setMaxNumTokens(8500)
+            .setCpuThreadCount(cpuThreadCount)
+            .setEnableBenchmark(true) // 응답마다 tokens/s를 말풍선에 표시
+            .build()
 
     /** 채팅 화면 → 모델 선택 화면으로. 활성 클라이언트를 해제한다(방 기록은 메모리에 유지). */
     fun changeModel() {
@@ -381,6 +416,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 screen = Screen.ModelSelect,
                 models = modelUiList(),
                 activeModelLabel = "",
+                activeBackend = "",
                 rooms = emptyList(),
                 activeRoomId = null,
                 messages = emptyList(),
@@ -876,6 +912,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         downloadClient.release()
         super.onCleared()
     }
+
+    /**
+     * CPU 추론 스레드 수. litertlm 기본값은 코어 수보다 적게 잡혀 느릴 수 있다.
+     * (SM-A426N 8코어·Gemma 4 E2B CPU 실측: 기본 대비 4~6 스레드가 prefill 약 1.6배, 8은 이득 없음)
+     */
+    private val cpuThreadCount: Int = (Runtime.getRuntime().availableProcessors() - 2).coerceIn(1, 6)
 
     /**
      * 동시에 열어 둘 채팅 세션 수. 세션마다 KV 캐시 메모리가 들므로 기기 RAM에 따라 정한다.

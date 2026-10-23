@@ -93,6 +93,13 @@ private val modelIsGated = false
 - 열린 세션 수는 기기 RAM에 따라 제한합니다(5GB 미만 2개 · 9GB 미만 3개 · 그 이상 4개). 넘치면 가장
   오래 안 쓴 방의 세션을 닫고, 그 방을 다시 열 때 대화 기록을 히스토리로 주입해 복원합니다.
 
+## 백엔드 폴백
+
+- 멀티모달 모델은 GPU, 텍스트 모델은 CPU로 엔진을 초기화합니다. GPU 초기화가 `LMBridgeError.BackendUnavailable`로
+  실패하면 CPU로 한 번 다시 시도하고, 실제 백엔드를 드로어의 모델 이름 아래에 표시합니다(예: `CPU (GPU 실패)`).
+- `LMBridgeError.InvalidModel`(파일 손상)은 백엔드를 바꿔도 실패하므로 재시도하지 않고 재다운로드를 안내합니다.
+- CPU 추론 스레드 수는 `코어 수 - 2`(1~6)로 지정합니다. litertlm 기본값보다 prefill이 빠릅니다(SM-A426N 실측 약 1.6배).
+
 ## 대화 저장
 
 - 채팅방(`conversations`)과 말풍선(`messages`)을 모델별로 Room에 저장합니다. 모델을 로드하면

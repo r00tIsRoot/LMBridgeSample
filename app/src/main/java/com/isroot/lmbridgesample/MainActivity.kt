@@ -334,6 +334,9 @@ private fun DrawerContent(
         Text("모델", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.secondary)
         Spacer(Modifier.height(4.dp))
         Text(state.activeModelLabel, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+        if (state.activeBackend.isNotEmpty()) {
+            Text("백엔드: ${state.activeBackend}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.secondary)
+        }
         Spacer(Modifier.height(8.dp))
         OutlinedButton(
             onClick = onChangeModel,

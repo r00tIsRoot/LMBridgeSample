@@ -59,6 +59,8 @@ class ChatViewModelE2ETest {
 
         onMain { vm.selectModel(modelKey) }
         waitUntil(vm, "model load") { it.screen == Screen.Chat && !it.preparing && it.activeRoomId != null }
+        // 텍스트 모델은 CPU로 초기화되고, 실제 백엔드가 화면 상태에 표시된다.
+        assertEquals("CPU", vm.uiState.value.activeBackend)
         // 이전 실행의 저장된 대화가 열릴 수 있으므로 빈 방에서 시작한다.
         val restoredRoom = vm.uiState.value.activeRoomId
         onMain { vm.createRoom() }

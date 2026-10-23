@@ -10,6 +10,7 @@ import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -52,6 +53,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -429,9 +431,30 @@ private fun ChatArea(
         ActivityResultContracts.GetContent(),
     ) { uri -> uri?.let(onAttachDocument) }
 
-    // 새 토큰이 붙을 때마다 맨 아래로 스크롤
-    LaunchedEffect(state.messages.size, state.messages.lastOrNull()?.text) {
-        if (state.messages.isNotEmpty()) listState.animateScrollToItem(state.messages.size - 1)
+    // 맨 아래 따라가기. 대화 진입·생성 중에는 맨 아래를 유지하되, 사용자가 직접 스크롤하면 그쪽을 우선한다.
+    var followBottom by remember { mutableStateOf(true) }
+
+    // 사용자가 끌기 시작하면 따라가기를 멈춘다. 이때 진행 중인 자동 스크롤은 사용자 입력 우선순위에 밀려 취소된다.
+    LaunchedEffect(listState) {
+        listState.interactionSource.interactions.collect {
+            if (it is DragInteraction.Start) followBottom = false
+        }
+    }
+    // 사용자가 스스로 맨 아래까지 내려오면 따라가기를 재개한다.
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.isScrollInProgress to listState.canScrollForward }
+            .collect { (scrolling, canScrollForward) -> if (!scrolling && !canScrollForward) followBottom = true }
+    }
+    // 방 진입, 생성 시작·완료 시에는 사용자가 위로 올려 두었더라도 맨 아래로 돌아간다.
+    LaunchedEffect(state.activeRoomId, state.isGenerating) { followBottom = true }
+
+    // 마지막 말풍선(본문·생각·통계)이 자랄 때마다 맨 아래로. animateScrollToItem(index)는 항목의 "윗변"을
+    // 화면 위에 맞춰 긴 답변의 첫 몇 줄만 보였다. 오프셋을 최대로 주면 목록 끝(마지막 항목의 아랫변)에서 멈춘다.
+    val last = state.messages.lastOrNull()
+    LaunchedEffect(state.messages.size, last, followBottom) {
+        if (followBottom && state.messages.isNotEmpty()) {
+            listState.scrollToItem(state.messages.lastIndex, Int.MAX_VALUE)
+        }
     }
 
     Column(Modifier.fillMaxSize()) {

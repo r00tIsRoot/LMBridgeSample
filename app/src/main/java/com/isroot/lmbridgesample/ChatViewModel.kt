@@ -2,6 +2,7 @@ package com.isroot.lmbridgesample
 
 import android.app.ActivityManager
 import android.app.Application
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
@@ -139,6 +140,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private val appContext: Application = app
     private val chatSystemPrompt = "너는 친절하고 간결한 한국어 도우미야."
     private val store = ChatStore.get(app)
+    private val prefs = app.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private var restoreAttempted = false
 
     // 다운로드 전용 클라이언트: 어떤 모델을 로드하든 무관하게 models(ModelDownloadManager)만 쓴다.
     // initialize()를 호출하지 않으므로 네이티브 자원은 점유하지 않는다.
@@ -219,6 +222,27 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             gated = it.gated,
             downloaded = downloads.isModelDownloaded(it.info),
         )
+    }
+
+    /**
+     * 앱 시작 시 지난 실행에서 마지막으로 쓴 모델을 자동으로 연다(받아 둔 모델일 때만, 프로세스당 한 번).
+     *
+     * 초기화 중 네이티브 크래시로 앱이 죽으면 다음 실행에서 같은 모델을 또 열어 크래시가 반복되므로,
+     * 시도 전에 표시를 남기고(동기 저장) 결과가 나오면 지운다. 표시가 남아 있으면 자동 로드를 건너뛴다.
+     */
+    fun restoreLastModel() {
+        if (restoreAttempted) return
+        restoreAttempted = true
+        val key = prefs.getString(KEY_LAST_MODEL, null) ?: return
+        if (prefs.getBoolean(KEY_RESTORE_PENDING, false)) {
+            prefs.edit().remove(KEY_LAST_MODEL).putBoolean(KEY_RESTORE_PENDING, false).commit()
+            _uiState.update { it.copy(loadError = "지난 실행에서 모델을 여는 중 앱이 종료되어 자동 실행을 건너뛰었습니다.") }
+            return
+        }
+        val sm = SampleModels.byKey(key) ?: return
+        if (!downloads.isModelDownloaded(sm.info)) return
+        prefs.edit().putBoolean(KEY_RESTORE_PENDING, true).commit()
+        loadModel(key)
     }
 
     /** 모델 카드 선택: 이미 받아둔 모델이면 바로 로드, 아니면 다운로드 화면으로. */
@@ -342,6 +366,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 val recent = rooms.maxBy { it.updatedAt } // 마지막으로 쓰던 방부터 연다
                 activeRoomId = recent.id
                 bindSession(client, recent) // 마지막으로 쓰던 방의 세션을 연다
+                prefs.edit().putString(KEY_LAST_MODEL, key).putBoolean(KEY_RESTORE_PENDING, false).apply()
                 _uiState.update { it.copy(preparing = false) }
                 renderChat()
             } catch (e: Throwable) {
@@ -350,6 +375,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     .joinToString(" ⟵ ") { "${it.javaClass.simpleName}: ${it.message}" }
                     .ifEmpty { "(원인 없음)" }
                 val hint = if (e is LMBridgeError.InvalidModel) "\n모델 파일이 손상되었습니다. 삭제 후 다시 받아 주세요." else ""
+                // 실패한 모델은 다음 실행에서 자동으로 열지 않는다.
+                prefs.edit().remove(KEY_LAST_MODEL).putBoolean(KEY_RESTORE_PENDING, false).apply()
                 releaseActiveClient()
                 _uiState.update {
                     it.copy(
@@ -902,6 +929,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     override fun onCleared() {
+        // 정상 종료(화면 닫기)로 로드가 중단된 것은 크래시가 아니므로 다음 자동 로드를 막지 않는다.
+        prefs.edit().putBoolean(KEY_RESTORE_PENDING, false).apply()
         // viewModelScope는 이미 취소됐으므로 코루틴을 못 쓴다. 자원만 떼어내(메인) 별도
         // 스레드에서 best-effort로 닫는다 — 메인 스레드 블로킹(ANR)을 피하기 위함.
         val (chats, client) = detachActiveResources()
@@ -942,5 +971,13 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         const val PERSIST_INTERVAL_MS = 500L
 
         const val NEW_ROOM_TITLE = "새 채팅"
+
+        const val PREFS_NAME = "lmbridge_sample"
+
+        /** 마지막으로 로드에 성공한 모델 key. */
+        const val KEY_LAST_MODEL = "last_model"
+
+        /** 자동 로드를 시작했고 아직 결과가 나지 않았음(그 사이 앱이 죽었는지 판단). */
+        const val KEY_RESTORE_PENDING = "restore_pending"
     }
 }

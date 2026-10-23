@@ -77,6 +77,8 @@ class MainActivity : ComponentActivity() {
             LMBridgeSampleTheme {
                 val vm: ChatViewModel = viewModel()
                 val state by vm.uiState.collectAsStateWithLifecycle()
+                // 지난 실행에서 마지막으로 쓴 모델을 자동으로 연다(ViewModel이 프로세스당 한 번만 수행).
+                LaunchedEffect(Unit) { vm.restoreLastModel() }
                 when (state.screen) {
                     Screen.ModelSelect -> ModelSelectScreen(state, onSelect = vm::selectModel)
                     Screen.Downloading -> DownloadScreen(state, onDownload = vm::downloadModel)
@@ -135,11 +137,28 @@ private fun ModelSelectScreen(state: UiState, onSelect: (String) -> Unit) {
                 }
             }
             Spacer(Modifier.height(16.dp))
+            // 받아 둔 모델을 위에 따로 모아 바로 고를 수 있게 한다.
+            val (installed, others) = state.models.partition { it.downloaded }
             LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                items(state.models) { m -> ModelCard(m, onSelect) }
+                if (installed.isNotEmpty()) {
+                    item { SectionHeader("설치된 모델 (${installed.size})") }
+                    items(installed, key = { it.key }) { m -> ModelCard(m, onSelect) }
+                    item { SectionHeader("다운로드 가능한 모델") }
+                }
+                items(others, key = { it.key }) { m -> ModelCard(m, onSelect) }
             }
         }
     }
+}
+
+@Composable
+private fun SectionHeader(text: String) {
+    Text(
+        text,
+        style = MaterialTheme.typography.labelLarge,
+        color = MaterialTheme.colorScheme.primary,
+        modifier = Modifier.padding(top = 4.dp),
+    )
 }
 
 @Composable
